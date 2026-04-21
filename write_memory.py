@@ -12,7 +12,28 @@ import uuid
 import argparse
 from datetime import datetime
 
-VAULT_DIR = os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain/dynamic")
+
+def _resolve_dynamic_dir() -> str:
+    """
+    Resolve the `dynamic/` directory under the configured bucket root.
+    Priority: $OMBRE_BUCKETS_DIR > config.yaml > built-in default.
+    优先级：环境变量 > config.yaml > 内置默认。
+    """
+    env_dir = os.environ.get("OMBRE_BUCKETS_DIR", "").strip()
+    if env_dir:
+        return os.path.join(os.path.expanduser(env_dir), "dynamic")
+    try:
+        from utils import load_config  # local import to avoid hard dep when missing
+        cfg = load_config()
+        return os.path.join(cfg["buckets_dir"], "dynamic")
+    except Exception:
+        # Fallback to project-local ./buckets/dynamic
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "buckets", "dynamic"
+        )
+
+
+VAULT_DIR = _resolve_dynamic_dir()
 
 
 def gen_id():
@@ -36,7 +57,7 @@ def write_memory(
     tags_yaml = "\n".join(f"- {t}" for t in tags)
 
     md = f"""---
-activation_count: 1
+activation_count: 0
 arousal: {arousal}
 created: '{now}'
 domain:

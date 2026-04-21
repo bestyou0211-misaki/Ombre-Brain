@@ -67,7 +67,7 @@ class TestFeelLifecycle:
         bm, dh, de, bd = isolated_tools
 
         bid = await bm.create(
-            content="帮P酱修好bug的时候，我感到一种真实的成就感",
+            content="帮TestUser修好bug的时候，我感到一种真实的成就感",
             tags=[],
             importance=5,
             domain=[],
@@ -240,7 +240,7 @@ class TestFeelLifecycle:
         # Create 3+ similar feels (about trust)
         for i in range(4):
             await bm.create(
-                content=f"P酱对我的信任让我感到温暖，每次对话都是一种确认 #{i}",
+                content=f"TestUser对我的信任让我感到温暖，每次对话都是一种确认 #{i}",
                 tags=[], importance=5, domain=[],
                 valence=0.8, arousal=0.4,
                 name=None, bucket_type="feel",

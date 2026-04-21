@@ -38,7 +38,11 @@ ANALYZE_PROMPT = (
     '}'
 )
 
-DATA_DIR = "/data/dynamic"
+DATA_DIR = os.path.join(
+    os.environ.get("OMBRE_BUCKETS_DIR", "").strip()
+    or (lambda: __import__("utils").load_config()["buckets_dir"])(),
+    "dynamic",
+)
 UNCLASS_DIR = os.path.join(DATA_DIR, "未分类")
 
 
@@ -48,11 +52,15 @@ def sanitize(name):
 
 
 async def reclassify():
+    from utils import load_config
+    cfg = load_config()
+    dehy = cfg.get("dehydration", {})
     client = AsyncOpenAI(
-        api_key=os.environ.get("OMBRE_API_KEY", ""),
-        base_url="https://api.siliconflow.cn/v1",
+        api_key=os.environ.get("OMBRE_API_KEY", "") or dehy.get("api_key", ""),
+        base_url=dehy.get("base_url", "https://api.deepseek.com/v1"),
         timeout=60.0,
     )
+    model_name = dehy.get("model", "deepseek-chat")
 
     files = sorted(glob.glob(os.path.join(UNCLASS_DIR, "*.md")))
     print(f"找到 {len(files)} 个未分类文件\n")
@@ -66,7 +74,7 @@ async def reclassify():
 
         try:
             resp = await client.chat.completions.create(
-                model="deepseek-ai/DeepSeek-V3",
+                model=model_name,
                 messages=[
                     {"role": "system", "content": ANALYZE_PROMPT},
                     {"role": "user", "content": full_text[:2000]},

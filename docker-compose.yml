@@ -21,11 +21,17 @@ services:
       - OMBRE_TRANSPORT=streamable-http     # Claude.ai requires streamable-http
       - OMBRE_BUCKETS_DIR=/data             # Container-internal bucket path / 容器内路径
     volumes:
-      # Mount your Obsidian vault (or any host directory) for persistent storage
-      # 挂载你的 Obsidian 仓库（或任意宿主机目录）做持久化存储
-      # Example / 示例:
-      #   - /path/to/your/Obsidian Vault/Ombre Brain:/data
-      - /Users/p0lar1s/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/Ombre Brain:/data
+      # Mount your Obsidian vault (or any host directory) for persistent storage.
+      # Set OMBRE_HOST_VAULT_DIR in your .env (or in the Dashboard "Storage" panel)
+      # to point at the host folder you want mounted into the container at /data.
+      # 挂载你的 Obsidian 仓库（或任意宿主机目录）做持久化存储。
+      # 在 .env（或 Dashboard 的「存储」面板）中设置 OMBRE_HOST_VAULT_DIR
+      # 指向你希望挂载到容器 /data 的宿主机目录。
+      #
+      # Examples / 示例:
+      #   OMBRE_HOST_VAULT_DIR=/path/to/your/Obsidian Vault/Ombre Brain
+      #   OMBRE_HOST_VAULT_DIR=~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/Ombre Brain
+      - ${OMBRE_HOST_VAULT_DIR:-./buckets}:/data
       - ./config.yaml:/app/config.yaml
 
   # Cloudflare Tunnel (optional) — expose to public internet

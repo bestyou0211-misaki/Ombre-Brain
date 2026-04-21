@@ -8,7 +8,25 @@ import os
 import re
 import shutil
 
-VAULT_DIR = os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain")
+
+def _resolve_vault_dir() -> str:
+    """
+    Resolve the bucket vault root.
+    Priority: $OMBRE_BUCKETS_DIR > config.yaml > built-in ./buckets.
+    """
+    env_dir = os.environ.get("OMBRE_BUCKETS_DIR", "").strip()
+    if env_dir:
+        return os.path.expanduser(env_dir)
+    try:
+        from utils import load_config
+        return load_config()["buckets_dir"]
+    except Exception:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "buckets"
+        )
+
+
+VAULT_DIR = _resolve_vault_dir()
 DYNAMIC_DIR = os.path.join(VAULT_DIR, "dynamic")
 
 # 新域关键词表（和 dehydrator.py 的 _local_analyze 一致）
