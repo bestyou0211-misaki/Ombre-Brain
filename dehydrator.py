@@ -386,6 +386,7 @@ class Dehydrator:
             header += "\n"
         
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
+        content = content.replace('\\"', '"')
         return f"{header}{content}"
 
     # ---------------------------------------------------------
