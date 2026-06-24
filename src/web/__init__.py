@@ -26,6 +26,7 @@ from . import hooks
 from . import buckets
 from . import import_api
 from . import github
+from . import embedding
 
 
 def register_all(mcp) -> None:
@@ -43,3 +44,4 @@ def register_all(mcp) -> None:
     buckets.register(mcp)
     import_api.register(mcp)
     github.register(mcp)
+    embedding.register(mcp)
