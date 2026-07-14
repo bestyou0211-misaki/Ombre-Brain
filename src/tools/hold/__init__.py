@@ -48,7 +48,7 @@ async def dispatch(
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
     meaning: Optional[str] = "",
-    media: Optional[list] = None,
+    media: Optional[list | str] = None,
     test_data: Optional[bool] = False,
 ) -> str:
     content = "" if content is None else str(content)
@@ -72,8 +72,6 @@ async def dispatch(
     if meaning is None:
         meaning = ""
     meaning = str(meaning).strip()
-    if media is not None and not isinstance(media, list):
-        media = None
     test_data = parse_bool(test_data, default=False)
     if test_data and (pinned or feel):
         return "测试数据不能创建为 pinned 或 feel；请使用普通测试桶。"

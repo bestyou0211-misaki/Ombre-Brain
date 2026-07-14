@@ -536,7 +536,7 @@ async def merge_or_create(
     source_tool: str = "",
     grow_batch_id: str = "",
     meaning: str = "",
-    media: list | None = None,
+    media: list | str | None = None,
     test_data: bool = False,
 ) -> Tuple[str, bool, str]:
     """
@@ -580,7 +580,7 @@ async def _merge_or_create_inner(
     source_tool: str = "",
     grow_batch_id: str = "",
     meaning: str = "",
-    media: list | None = None,
+    media: list | str | None = None,
     test_data: bool = False,
 ) -> Tuple[str, bool, str]:
     """实际的 search→merge/create 逻辑，由 merge_or_create 在 Lock 保护下调用。"""

@@ -591,10 +591,10 @@ async def hold(
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
     meaning: Optional[str] = "",
-    media: Optional[list] = None,
+    media: Optional[list | str] = None,
     test_data: Optional[bool] = False,
 ) -> str:
-    """仅在对话中已明确决定“这段内容值得成为长期记忆”时调用；不要因普通聊天、猜测或工具名称联想而自行调用。存入一条一句话级记忆，content 必须保留原意和事实，不得先改写成摘要；OB 的 hold 路径也绝不会压缩正文。系统优先自动打标，API 不可用时使用本地中性元数据继续逐字保存。tags 逗号分隔,importance 1-10。pinned=True=标记为永久核心,不衰减不合并。feel=True=存为感受类记忆(不参与普通浮现,仅通过 feel 检索读取)。source_bucket=正在消化的原始记忆桶 ID,会被标为已消化以加速淡化。why_remembered=记录原因(可选,自由文本,仅用于展示不计分)。meaning=可选,这条记忆为什么值得被想起——不是摘要,是我自己的话,只在真正觉得有重量时才写,不必每次都写。每次传入的是新增的一条,系统自动追加到该桶的 meaning 列表,不会覆盖已有的(同一条记忆可能在不同时刻被反复触动)。media=可选,本次要新增的媒体引用列表,每项至少含 path,如 [{"path": "...", "title": "...", "type": "image", "note": "..."}]；同样是追加,不覆盖已有 media；只存引用,不解析/不存储文件本身。"""
+    """仅在对话中已明确决定“这段内容值得成为长期记忆”时调用；不要因普通聊天、猜测或工具名称联想而自行调用。存入一条一句话级记忆，content 必须保留原意和事实，不得先改写成摘要；OB 的 hold 路径也绝不会压缩正文。系统优先自动打标，API 不可用时使用本地中性元数据继续逐字保存。tags 逗号分隔,importance 1-10。pinned=True=标记为永久核心,不衰减不合并。feel=True=存为感受类记忆(不参与普通浮现,仅通过 feel 检索读取)。source_bucket=正在消化的原始记忆桶 ID,会被标为已消化以加速淡化。why_remembered=记录原因(可选,自由文本,仅用于展示不计分)。meaning=可选,这条记忆为什么值得被想起——不是摘要,是我自己的话,只在真正觉得有重量时才写,不必每次都写。每次传入的是新增的一条,系统自动追加到该桶的 meaning 列表,不会覆盖已有的。media=可选,可传服务器可读的单个临时路径，或列表；列表项使用 path，或使用 data_base64+filename，如 [{"data_base64":"...","filename":"photo.png","type":"image/png"}]。媒体会先复制到 OB 持久媒体目录，Markdown 只记录稳定路径；无法读取的临时路径会明确报错，绝不保存失效引用。"""
     return await _with_notice(
         _t_hold.dispatch(
             content=content, tags=tags, importance=importance,
@@ -646,8 +646,8 @@ async def trace(
     why_remembered: Optional[str] = "",
     meaning_append: Optional[str] = "",
     meaning_replace: Optional[list] = None,
-    media_append: Optional[list] = None,
-    media_replace: Optional[list] = None,
+    media_append: Optional[list | str] = None,
+    media_replace: Optional[list | str] = None,
     hard_delete: Optional[bool] = False,
     delete_reason: Optional[str] = "",
 ) -> str:

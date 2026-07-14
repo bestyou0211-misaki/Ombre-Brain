@@ -243,6 +243,28 @@ def load_config(config_path: Optional[str] = None) -> dict:
     #   "若环境变量非空 → 写到 config 的某个嵌套 key 上"
     # 现在统一走 _apply_env_override()，新增一项只要加一行表项。
 
+    # v1.x 兼容：旧变量不得因重构而静默失效。新变量显式设置时始终优先。
+    legacy_api_key = os.environ.get("OMBRE_API_KEY", "").strip()
+    legacy_base_url = os.environ.get("OMBRE_BASE_URL", "").strip()
+    if legacy_api_key and not os.environ.get("OMBRE_COMPRESS_API_KEY", "").strip():
+        config.setdefault("dehydration", {})["api_key"] = legacy_api_key
+        logging.warning(
+            "OMBRE_API_KEY 是兼容变量；请迁移到 OMBRE_COMPRESS_API_KEY，旧名仍会继续生效。"
+        )
+    if legacy_base_url and not os.environ.get("OMBRE_COMPRESS_BASE_URL", "").strip():
+        config.setdefault("dehydration", {})["base_url"] = legacy_base_url
+        logging.warning(
+            "OMBRE_BASE_URL 是兼容变量；请迁移到 OMBRE_COMPRESS_BASE_URL，旧名仍会继续生效。"
+        )
+
+    # v1.3 Zeabur 模板曾使用通用 PASSWORD；只在正式变量缺失时兼容映射。
+    legacy_password = os.environ.get("PASSWORD", "").strip()
+    if legacy_password and not os.environ.get("OMBRE_DASHBOARD_PASSWORD", "").strip():
+        os.environ["OMBRE_DASHBOARD_PASSWORD"] = legacy_password
+        logging.warning(
+            "PASSWORD 是兼容变量；请迁移到 OMBRE_DASHBOARD_PASSWORD，旧名仍会继续生效。"
+        )
+
     # 压缩组（脱水/打标/合并）—— 写到 config["dehydration"][*]
     _apply_env_override(config, "OMBRE_COMPRESS_API_KEY", "dehydration", "api_key")
     _apply_env_override(config, "OMBRE_COMPRESS_BASE_URL", "dehydration", "base_url")
@@ -346,11 +368,24 @@ def load_config(config_path: Optional[str] = None) -> dict:
         except Exception:
             pass
 
+    # 媒体必须和记忆一起落在持久卷；默认使用数据目录下独立的 _media。
+    # OMBRE_MEDIA_DIR 仅在确实挂载了另一块持久盘时覆盖。
+    media_dir = os.environ.get("OMBRE_MEDIA_DIR", "").strip()
+    config["media_dir"] = media_dir or os.path.join(str(config["buckets_dir"]), "_media")
+    try:
+        config["media_max_bytes"] = max(
+            1,
+            int(os.environ.get("OMBRE_MEDIA_MAX_BYTES", 25 * 1024 * 1024)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        config["media_max_bytes"] = 25 * 1024 * 1024
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
     buckets_dir: str = str(config["buckets_dir"])
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
+    os.makedirs(str(config["media_dir"]), exist_ok=True)
 
     return config
 

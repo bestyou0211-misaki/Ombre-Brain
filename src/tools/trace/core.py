@@ -53,8 +53,8 @@ async def trace_core(
     why_remembered: Optional[str] = "",
     meaning_append: Optional[str] = "",
     meaning_replace: Optional[list] = None,
-    media_append: Optional[list] = None,
-    media_replace: Optional[list] = None,
+    media_append: Optional[list | str] = None,
+    media_replace: Optional[list | str] = None,
     hard_delete: Optional[bool] = False,
     delete_reason: Optional[str] = "",
 ) -> str:

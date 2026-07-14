@@ -39,7 +39,7 @@ async def store_core(
     arousal: float,
     why_remembered: str,
     meaning: str = "",
-    media: list | None = None,
+    media: list | str | None = None,
     test_data: bool = False,
 ) -> str:
     metadata_fallback = False

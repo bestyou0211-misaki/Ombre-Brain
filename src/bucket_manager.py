@@ -92,6 +92,7 @@ from utils import (
     parse_bool,
     parse_iso_datetime,
 )
+from media_store import MediaStore
 from bucket_scoring import (
     calc_topic_score,
     calc_emotion_score,
@@ -219,6 +220,11 @@ class BucketManager:
         self.v3_runtime = v3_runtime
         # --- Read storage paths from config / 从配置中读取存储路径 ---
         self.base_dir = config["buckets_dir"]
+        self.media_store = MediaStore(
+            self.base_dir,
+            str(config.get("media_dir") or os.path.join(self.base_dir, "_media")),
+            max_bytes=int(config.get("media_max_bytes") or 25 * 1024 * 1024),
+        )
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
@@ -509,10 +515,7 @@ class BucketManager:
 
     @classmethod
     def _normalize_media(cls, media) -> list[dict]:
-        """校验/裁剪 media 引用列表。path 是唯一必填项，其余字段可选透传。
-
-        系统不解析、不存储、不迁移文件本身，只保存不透明的引用字符串。
-        """
+        """校验持久媒体元数据；path 必须已经由 MediaStore 稳定化。"""
         if not media:
             return []
         if not isinstance(media, list):
@@ -534,6 +537,17 @@ class BucketManager:
             note = item.get("note")
             if note:
                 entry["note"] = cls._sanitize_text(str(note)).strip()[:_MEDIA_NOTE_MAX]
+            digest = str(item.get("sha256") or "").lower()
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                entry["sha256"] = digest
+            try:
+                size = int(item.get("size"))
+            except (TypeError, ValueError, OverflowError):
+                size = -1
+            if size >= 0:
+                entry["size"] = size
+            if item.get("stored") is True:
+                entry["stored"] = True
             normalized.append(entry)
             if len(normalized) >= _MEDIA_MAX_ITEMS:
                 break
@@ -824,7 +838,7 @@ class BucketManager:
         bucket_id_override: str = "",
         allow_embedding_fallback: bool = False,
         meaning: str = "",
-        media: Optional[list[dict]] = None,
+        media: Any = None,
         test_data: bool = False,
     ) -> str:
         """
@@ -954,7 +968,8 @@ class BucketManager:
         meaning_item = self._normalize_meaning_item(meaning)
         if meaning_item:
             metadata["meaning"] = [meaning_item]
-        normalized_media = self._normalize_media(media)
+        persisted_media = await self.media_store.persist(bucket_id, media)
+        normalized_media = self._normalize_media(persisted_media)
         if normalized_media:
             metadata["media"] = normalized_media
         # --- iter 1.8: plan 的「承诺重量」0.0-1.0，与 importance 不同 ---
@@ -1190,10 +1205,14 @@ class BucketManager:
             ) or [_DEFAULT_DOMAIN_NAME]
         if "media" in kwargs:
             # Miss: media 是整体覆盖写入（trace 的 media_replace）。传空列表即清空该字段。
-            kwargs["media"] = self._normalize_media(kwargs["media"])
+            kwargs["media"] = self._normalize_media(
+                await self.media_store.persist(bucket_id, kwargs["media"])
+            )
         if "media_append" in kwargs:
             # Miss: media_append 是追加写入（trace 的 media_append / hold 每次调用）。
-            kwargs["media_append"] = self._normalize_media(kwargs["media_append"])
+            kwargs["media_append"] = self._normalize_media(
+                await self.media_store.persist(bucket_id, kwargs["media_append"])
+            )
         if "meaning" in kwargs:
             # Miss: meaning 整体覆盖写入（trace 的 meaning_replace，用于纠错/清理）。
             kwargs["meaning"] = self._normalize_meaning_list(kwargs["meaning"])

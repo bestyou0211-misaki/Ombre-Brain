@@ -42,6 +42,7 @@ config.yaml
 docs/*
 docs/**/*
 !docs/CLAUDE_PROMPT.md
+!docs/ENVIRONMENT_VARIABLES.md
 !docs/INTERNALS.md
 !docs/MULTI_OWNER.md
 !docs/OPERATIONS.md
@@ -51,6 +52,7 @@ deploy/
 !deploy/fetch_cloudflared.py
 *.md
 !docs/CLAUDE_PROMPT.md
+!docs/ENVIRONMENT_VARIABLES.md
 !docs/INTERNALS.md
 !docs/MULTI_OWNER.md
 !docs/OPERATIONS.md
