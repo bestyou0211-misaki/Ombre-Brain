@@ -122,6 +122,7 @@ async def store_core(
                 _recall_lines.append(f"\U0001fa84 [{_bid}] {_name}: {_body}")
             result += "\n\n\U0001f517 关联唤醒:\n" + "\n".join(_recall_lines)
     except Exception as _e:
+        result += f"\n[debug-err] hook failed: {type(_e).__name__}: {_e}"
         rt.logger.warning(f"write-then-recall hook failed: {type(_e).__name__}: {_e}")
 
     return result
