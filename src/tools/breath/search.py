@@ -36,17 +36,17 @@ _SURFACE_POLICY = SurfacePolicyVM.default()
 
 _VECTOR_QUERY_TOPK = 50
 
-def _schedule_use(bucket_ids: list[str], source: str) -> None:
-    """Explicit breath search is a real use; keep compatibility with older managers."""
+async def _record_use(bucket_ids: list[str], source: str) -> None:
+    """Explicit breath search is a real use; persist it before returning."""
     if not bucket_ids:
         return
     recorder = getattr(rt.bucket_mgr, "record_use_many", None)
     if callable(recorder):
-        asyncio.create_task(recorder(bucket_ids, source=source))
+        await recorder(bucket_ids, source=source)
         return
     legacy_touch = getattr(rt.bucket_mgr, "touch_many", None)
     if callable(legacy_touch):
-        asyncio.create_task(legacy_touch(bucket_ids, ripple=False))
+        await legacy_touch(bucket_ids, ripple=False)
 
 _SEMANTIC_DISABLED_NOTE = "[检索降级：语义索引暂不可用，本次仅使用关键词/BM25。]"
 _BUDGET_NOTICE = "[token 预算不足：命中的下一条记忆未被截断或摘要，请提高 max_tokens 后重试。]"
@@ -127,7 +127,7 @@ async def surface_search(
             )
             if entry_tokens > max_tokens:
                 return _BUDGET_NOTICE
-            _schedule_use([exact_bucket["id"]], source="breath_exact")
+            await _record_use([exact_bucket["id"]], source="breath_exact")
             if rt.fire_webhook:
                 await rt.fire_webhook(
                     "breath",
@@ -185,7 +185,7 @@ async def surface_search(
     # 主动 query 是显式召回，按真实使用写 retrieval + use；
     # 自动写即读仍只记弱关联，避免关系图回声自我续命。
     if used_ids:
-        _schedule_use(used_ids, source="breath_search")
+        await _record_use(used_ids, source="breath_search")
 
     # --- 检索结果 < 3 时 40% 概率随机浮现 ---
     if not budget_blocked and len(matches) < min(3, max_results) and random.random() < 0.4:
