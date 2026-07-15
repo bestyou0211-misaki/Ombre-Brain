@@ -74,6 +74,7 @@ _TAGS_MAX = 10                 # extraction 试在 10 个以内（与 dehydrator
 
 # --- merge_or_create 默认阈值 ---
 _DEFAULT_MERGE_THRESHOLD = 75
+_IMPORT_RELATION_THRESHOLD = 45.0
 
 # --- detect_patterns：embedding 聚类 ---
 _PATTERN_MIN_DYNAMIC_BUCKETS = 5  # 动态桶少于该数 → 不作处理
@@ -120,118 +121,224 @@ def _strip_md_fence(raw: str) -> str:
 # 格式解析器 — 将任意格式标准化为对话轮次
 # ============================================================
 
+def _normalize_role(role: Any) -> str:
+    value = str(role or "user").strip().lower()
+    if value in ("user", "human"):
+        return "user"
+    if value in ("assistant", "ai", "bot", "claude", "gpt", "deepseek"):
+        return "assistant"
+    if value in ("tool", "function"):
+        return "tool"
+    if value in ("system", "developer"):
+        return value
+    return value or "user"
+
+
+def _channel_for_role(role: str) -> str:
+    normalized = _normalize_role(role)
+    if normalized == "user":
+        return "user_visible"
+    if normalized == "assistant":
+        return "assistant_visible"
+    if normalized == "tool":
+        return "tool_result"
+    return "injected_context"
+
+
+def _extract_text_content(value: Any) -> str:
+    """Extract visible text while leaving tool-use payloads out of spoken content."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_extract_text_content(item) for item in value]
+        return "\n".join(part for part in parts if part.strip())
+    if not isinstance(value, dict):
+        return str(value)
+    value_type = str(value.get("type") or value.get("content_type") or "").lower()
+    if value_type in ("tool_use", "tool_call", "function_call"):
+        return ""
+    if "parts" in value:
+        return _extract_text_content(value.get("parts"))
+    for key in ("text", "content", "value"):
+        candidate = value.get(key)
+        if isinstance(candidate, (str, list, dict)):
+            text = _extract_text_content(candidate)
+            if text.strip():
+                return text
+    return ""
+
+
+def _make_turn(
+    *,
+    role: Any,
+    content: Any,
+    timestamp: Any = "",
+    platform: str,
+    conversation_id: Any = "",
+    message_id: Any = "",
+    channel: str = "",
+) -> dict | None:
+    text = _extract_text_content(content).strip()
+    if not text:
+        return None
+    normalized_role = _normalize_role(role)
+    return {
+        "role": normalized_role,
+        "content": text,
+        "timestamp": "" if timestamp is None else str(timestamp),
+        "platform": str(platform or "unknown"),
+        "conversation_id": "" if conversation_id is None else str(conversation_id),
+        "message_id": "" if message_id is None else str(message_id),
+        "channel": channel or _channel_for_role(normalized_role),
+    }
+
+
 def _parse_claude_json(data: dict | list) -> list[dict]:
-    """Parse Claude.ai export JSON → [{role, content, timestamp}, ...]"""
-    turns = []
+    """Parse Claude.ai export JSON with speaker/channel/source evidence."""
+    turns: list[dict] = []
     conversations = data if isinstance(data, list) else [data]
     for conv in conversations:
         if not isinstance(conv, dict):
             continue
+        conversation_id = (
+            conv.get("uuid")
+            or conv.get("id")
+            or conv.get("conversation_id")
+            or conv.get("name")
+            or ""
+        )
         messages = conv.get("chat_messages", conv.get("messages", []))
-        for msg in messages:
+        for index, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
-            content = msg.get("text", msg.get("content", ""))
-            if isinstance(content, list):
-                content = " ".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            if not content or not content.strip():
-                continue
             role = msg.get("sender", msg.get("role", "user"))
-            ts = msg.get("created_at", msg.get("timestamp", ""))
-            turns.append({"role": role, "content": content.strip(), "timestamp": ts})
+            content = msg.get("text", msg.get("content", ""))
+            turn = _make_turn(
+                role=role,
+                content=content,
+                timestamp=msg.get("created_at", msg.get("timestamp", "")),
+                platform="claude",
+                conversation_id=conversation_id,
+                message_id=msg.get("uuid") or msg.get("id") or index,
+            )
+            if turn:
+                turns.append(turn)
     return turns
 
 
 def _parse_chatgpt_json(data: list | dict) -> list[dict]:
-    """Parse ChatGPT export JSON → [{role, content, timestamp}, ...]"""
-    turns = []
+    """Parse ChatGPT export JSON with visible/tool/injected channels separated."""
+    turns: list[dict] = []
     conversations = data if isinstance(data, list) else [data]
     for conv in conversations:
         if not isinstance(conv, dict):
             continue
+        conversation_id = (
+            conv.get("id")
+            or conv.get("conversation_id")
+            or conv.get("title")
+            or ""
+        )
         mapping = conv.get("mapping", {})
         if mapping:
-            # ChatGPT uses a tree structure with mapping
-            # Filter out None nodes before sorting
-            valid_nodes = [n for n in mapping.values() if isinstance(n, dict)]
+            valid_nodes = [
+                (node_id, node)
+                for node_id, node in mapping.items()
+                if isinstance(node, dict)
+            ]
 
-            def _node_ts(n):
-                msg = n.get("message")
-                if not isinstance(msg, dict):
-                    return 0
-                return msg.get("create_time") or 0
+            def _node_ts(pair):
+                msg = pair[1].get("message")
+                return msg.get("create_time") or 0 if isinstance(msg, dict) else 0
 
-            sorted_nodes = sorted(valid_nodes, key=_node_ts)
-            for node in sorted_nodes:
+            for node_id, node in sorted(valid_nodes, key=_node_ts):
                 msg = node.get("message")
-                if not msg or not isinstance(msg, dict):
-                    continue
-                content_obj = msg.get("content", {})
-                content_parts = content_obj.get("parts", []) if isinstance(content_obj, dict) else []
-                content = " ".join(str(p) for p in content_parts if p)
-                if not content.strip():
-                    continue
-                role = (msg.get("author") or {}).get("role", "user")
-                ts = msg.get("create_time", "")
-                if isinstance(ts, (int, float)):
-                    ts = datetime.fromtimestamp(ts).isoformat()
-                turns.append({"role": role, "content": content.strip(), "timestamp": str(ts)})
-        else:
-            # Simpler format: list of messages
-            messages = conv.get("messages", [])
-            for msg in messages:
                 if not isinstance(msg, dict):
                     continue
-                content_raw = msg.get("content", msg.get("text", "")) or ""
-                if isinstance(content_raw, dict):
-                    content = " ".join(str(p) for p in content_raw.get("parts", []))
-                else:
-                    content = str(content_raw)
-                if not content or not content.strip():
+                author = msg.get("author") or {}
+                role = author.get("role", "user") if isinstance(author, dict) else "user"
+                timestamp = msg.get("create_time", "")
+                if isinstance(timestamp, (int, float)):
+                    timestamp = datetime.fromtimestamp(timestamp).isoformat()
+                turn = _make_turn(
+                    role=role,
+                    content=msg.get("content", {}),
+                    timestamp=timestamp,
+                    platform="chatgpt",
+                    conversation_id=conversation_id,
+                    message_id=msg.get("id") or node_id,
+                )
+                if turn:
+                    turns.append(turn)
+        else:
+            for index, msg in enumerate(conv.get("messages", [])):
+                if not isinstance(msg, dict):
                     continue
                 role = msg.get("role") or (msg.get("author") or {}).get("role", "user")
-                ts = msg.get("timestamp", msg.get("create_time", ""))
-                turns.append({"role": role, "content": content.strip(), "timestamp": str(ts)})
+                timestamp = msg.get("timestamp", msg.get("create_time", ""))
+                if isinstance(timestamp, (int, float)):
+                    timestamp = datetime.fromtimestamp(timestamp).isoformat()
+                turn = _make_turn(
+                    role=role,
+                    content=msg.get("content", msg.get("text", "")),
+                    timestamp=timestamp,
+                    platform="chatgpt",
+                    conversation_id=conversation_id,
+                    message_id=msg.get("id") or index,
+                )
+                if turn:
+                    turns.append(turn)
     return turns
 
 
 def _parse_markdown(text: str) -> list[dict]:
-    """Parse Markdown/plain text → [{role, content, timestamp}, ...]"""
-    # Try to detect conversation patterns
+    """Parse Markdown/plain text into evidence-aware turns."""
     lines = text.split("\n")
-    turns = []
+    turns: list[dict] = []
     current_role = "user"
     current_content: list[str] = []
+    message_index = 0
+
+    def flush() -> None:
+        nonlocal current_content, message_index
+        content = "\n".join(current_content).strip()
+        if content:
+            turn = _make_turn(
+                role=current_role,
+                content=content,
+                platform="text",
+                message_id=message_index,
+            )
+            if turn:
+                turns.append(turn)
+                message_index += 1
+        current_content = []
 
     for line in lines:
         stripped = line.strip()
-        # Detect role switches
-        if stripped.lower().startswith(("human:", "user:", "你:", "我:")):
-            if current_content:
-                turns.append({"role": current_role, "content": "\n".join(current_content).strip(), "timestamp": ""})
+        lowered = stripped.lower()
+        if lowered.startswith(("human:", "user:", "你:", "我:")):
+            flush()
             current_role = "user"
             content_after = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
             current_content = [content_after] if content_after else []
-        elif stripped.lower().startswith(("assistant:", "claude:", "ai:", "gpt:", "bot:", "deepseek:")):
-            if current_content:
-                turns.append({"role": current_role, "content": "\n".join(current_content).strip(), "timestamp": ""})
+        elif lowered.startswith(("assistant:", "claude:", "ai:", "gpt:", "bot:", "deepseek:")):
+            flush()
             current_role = "assistant"
             content_after = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
             current_content = [content_after] if content_after else []
         else:
             current_content.append(line)
+    flush()
 
-    if current_content:
-        content = "\n".join(current_content).strip()
-        if content:
-            turns.append({"role": current_role, "content": content, "timestamp": ""})
-
-    # If no role patterns detected, treat entire text as one big chunk
-    if not turns:
-        turns = [{"role": "user", "content": text.strip(), "timestamp": ""}]
-
+    if not turns and text.strip():
+        turn = _make_turn(role="user", content=text, platform="text", message_id=0)
+        if turn:
+            turns = [turn]
     return turns
 
 
@@ -279,76 +386,107 @@ def detect_and_parse(raw_content: str, filename: str = "") -> list[dict]:
 # 分窗 — 按对话轮次边界切为 ~10k token 窗口
 # ============================================================
 
-def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, human_label: str = "用户") -> list[dict]:
-    """
-    Group conversation turns into chunks of ~target_tokens.
-    Returns list of {content, timestamp_start, timestamp_end, turn_count}.
-    按对话轮次边界将对话分为 ~target_tokens 大小的窗口。
-    human_label：对话中「用户」那一侧的称呼，默认「用户」，可传入 config["human"] 使内容更个人化。
-    """
+def chunk_turns(
+    turns: list[dict],
+    target_tokens: int = _CHUNK_TARGET_TOKENS,
+    human_label: str = "用户",
+) -> list[dict]:
+    """Group turns into chunks while preserving channel and source evidence."""
     chunks: list[dict] = []
     current_lines: list[str] = []
     current_tokens = 0
     first_ts = ""
     last_ts = ""
     turn_count = 0
+    channels: list[str] = []
+    message_ids: list[str] = []
+    conversation_ids: list[str] = []
+    platforms: list[str] = []
 
-    for turn in turns:
-        role_label = human_label if turn["role"] in ("user", "human") else "AI"
-        line = f"[{role_label}] {turn['content']}"
-        line_tokens = count_tokens_approx(line)
+    def append_unique(target: list[str], value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in target:
+            target.append(text)
 
-        # If single turn exceeds target, split it
-        if line_tokens > target_tokens * _CHUNK_OVERSIZE_RATIO:
-            # Flush current
-            if current_lines:
-                chunks.append({
-                    "content": "\n".join(current_lines),
-                    "timestamp_start": first_ts,
-                    "timestamp_end": last_ts,
-                    "turn_count": turn_count,
-                })
-                current_lines = []
-                current_tokens = 0
-                turn_count = 0
-                first_ts = ""
+    def reset_meta() -> None:
+        nonlocal first_ts, last_ts, turn_count, channels, message_ids, conversation_ids, platforms
+        first_ts = ""
+        last_ts = ""
+        turn_count = 0
+        channels = []
+        message_ids = []
+        conversation_ids = []
+        platforms = []
 
-            # Add oversized turn as its own chunk
-            chunks.append({
-                "content": line,
-                "timestamp_start": turn.get("timestamp", ""),
-                "timestamp_end": turn.get("timestamp", ""),
-                "turn_count": 1,
-            })
-            continue
-
-        if current_tokens + line_tokens > target_tokens and current_lines:
-            chunks.append({
-                "content": "\n".join(current_lines),
-                "timestamp_start": first_ts,
-                "timestamp_end": last_ts,
-                "turn_count": turn_count,
-            })
-            current_lines = []
-            current_tokens = 0
-            turn_count = 0
-            first_ts = ""
-
-        if not first_ts:
-            first_ts = turn.get("timestamp", "")
-        last_ts = turn.get("timestamp", "")
-        current_lines.append(line)
-        current_tokens += line_tokens
-        turn_count += 1
-
-    if current_lines:
+    def emit() -> None:
+        nonlocal current_lines, current_tokens
+        if not current_lines:
+            return
         chunks.append({
             "content": "\n".join(current_lines),
             "timestamp_start": first_ts,
             "timestamp_end": last_ts,
             "turn_count": turn_count,
+            "channels": list(channels),
+            "message_ids": list(message_ids),
+            "conversation_ids": list(conversation_ids),
+            "platforms": list(platforms),
         })
+        current_lines = []
+        current_tokens = 0
+        reset_meta()
 
+    for turn in turns:
+        channel = str(turn.get("channel") or _channel_for_role(turn.get("role", "user")))
+        if channel == "user_visible":
+            role_label = human_label
+        elif channel == "assistant_visible":
+            role_label = "AI"
+        elif channel == "tool_result":
+            role_label = "工具结果"
+        else:
+            role_label = "系统注入"
+        marker_parts = [role_label, channel]
+        if turn.get("message_id"):
+            marker_parts.append(f"msg:{turn['message_id']}")
+        if turn.get("conversation_id"):
+            marker_parts.append(f"conv:{turn['conversation_id']}")
+        evidence = "|".join(marker_parts[1:])
+        line = f"[{role_label}] [{evidence}] {turn['content']}"
+        line_tokens = count_tokens_approx(line)
+
+        if line_tokens > target_tokens * _CHUNK_OVERSIZE_RATIO:
+            emit()
+            timestamp = str(turn.get("timestamp") or "")
+            chunks.append({
+                "content": line,
+                "timestamp_start": timestamp,
+                "timestamp_end": timestamp,
+                "turn_count": 1,
+                "channels": [channel],
+                "message_ids": [str(turn.get("message_id"))] if turn.get("message_id") else [],
+                "conversation_ids": [str(turn.get("conversation_id"))] if turn.get("conversation_id") else [],
+                "platforms": [str(turn.get("platform"))] if turn.get("platform") else [],
+            })
+            continue
+
+        if current_tokens + line_tokens > target_tokens and current_lines:
+            emit()
+
+        timestamp = str(turn.get("timestamp") or "")
+        if timestamp and not first_ts:
+            first_ts = timestamp
+        if timestamp:
+            last_ts = timestamp
+        append_unique(channels, channel)
+        append_unique(message_ids, turn.get("message_id"))
+        append_unique(conversation_ids, turn.get("conversation_id"))
+        append_unique(platforms, turn.get("platform"))
+        current_lines.append(line)
+        current_tokens += line_tokens
+        turn_count += 1
+
+    emit()
     return chunks
 
 
@@ -437,6 +575,10 @@ def preview_import(raw_content: str, filename: str = "", human_label: str = "用
                 "role": str(turn.get("role", "")),
                 "content": str(turn.get("content", ""))[:160],
                 "timestamp": str(turn.get("timestamp", "")),
+                "channel": str(turn.get("channel", "")),
+                "message_id": str(turn.get("message_id", "")),
+                "conversation_id": str(turn.get("conversation_id", "")),
+                "platform": str(turn.get("platform", "")),
             }
             for turn in turns[:3]
         ],
@@ -524,14 +666,15 @@ class ImportState:
 IMPORT_EXTRACT_PROMPT = """你是一个对话记忆提取专家。从以下对话片段中提取值得长期记住的信息。
 
 提取规则：
-1. 提取用户的事实、偏好、习惯、重要事件、情感时刻
-2. 同一话题的零散信息整合为一条记忆
-3. 过滤掉纯技术调试输出、代码块、重复问答、无意义寒暄
-4. 如果对话中有特殊暗号、仪式性行为、关键承诺等，标记 preserve_raw=true
-5. 如果内容是用户和我之间的习惯性互动模式（例如打招呼方式、告别习惯），标记 is_pattern=true
-6. 每条记忆不少于30字
-7. 总条目数控制在 0~5 个（没有值得记的就返回空数组）
-8. 在 content 中对人名、地名、专有名词用 [[双链]] 标记
+1. 提取双方值得长期记住的事实、偏好、重要事件、明确选择、边界、承诺和关系变化
+2. 只有 user_visible / assistant_visible 才是双方真正说出口的话；tool_result / injected_context 只能作为证据，不能冒充承诺或当轮事实
+3. 同一事实的重复可以整合；态度变化、补充、反例和前后转向必须保留，不要熨平成一个静态结论
+4. 过滤纯技术噪音，但技术事件若改变了关系、选择或长期做法，仍应提取
+5. 如果对话中有特殊暗号、仪式性行为、关键承诺等，标记 preserve_raw=true
+6. 如果内容是用户和我之间的习惯性互动模式（例如打招呼方式、告别习惯），标记 is_pattern=true
+7. 每条记忆不少于30字
+8. 总条目数控制在 0~5 个（没有值得记的就返回空数组）
+9. 在 content 中对人名、地名、专有名词用 [[双链]] 标记
 
 输出格式（纯 JSON 数组，无其他内容）：
 [
@@ -714,13 +857,27 @@ class ImportEngine:
         )
         return self.state.to_dict()
 
+    def _chunk_provenance(self, chunk: dict) -> dict:
+        platforms = [str(value) for value in chunk.get("platforms", []) if value]
+        return {
+            "kind": "conversation_import",
+            "source_platform": ",".join(platforms) or "unknown",
+            "source_file": str(self.state.data.get("source_file") or ""),
+            "source_hash": str(self.state.data.get("source_hash") or ""),
+            "imported_at": now_iso(),
+            "timestamp_start": str(chunk.get("timestamp_start") or ""),
+            "timestamp_end": str(chunk.get("timestamp_end") or ""),
+            "conversation_ids": chunk.get("conversation_ids", []),
+            "message_ids": chunk.get("message_ids", []),
+            "channels": chunk.get("channels", []),
+        }
+
     async def _process_single_chunk(self, chunk: dict, preserve_raw: bool):
-        """Extract memories from a single chunk and store them."""
+        """Extract memories from a single chunk and store them with evidence."""
         content = chunk["content"]
         if not content.strip():
             return
 
-        # --- LLM extraction ---
         try:
             items = await self._extract_memories(content)
             self.state.data["api_calls"] += 1
@@ -728,7 +885,6 @@ class ImportEngine:
             err_msg = f"LLM extraction failed: {e}"
             logger.warning(err_msg)
             self.state.data["api_calls"] += 1
-            # 把 LLM 失败原因写入 state.errors，让 /api/import/status 可见
             if len(self.state.data["errors"]) < _STATE_ERR_LOG_MAX:
                 self.state.data["errors"].append(err_msg)
             return
@@ -736,18 +892,12 @@ class ImportEngine:
         if not items:
             return
 
-        # --- Store each extracted memory ---
+        provenance = self._chunk_provenance(chunk)
+        occurred_at = str(chunk.get("timestamp_start") or chunk.get("timestamp_end") or "")
         for item in items:
             try:
                 should_preserve = preserve_raw or item.get("preserve_raw", False)
-
                 if should_preserve:
-                    # preserve_raw 桶不走 _merge_or_create_item 的查重（原文必须逐字
-                    # 保留，不能被 LLM 摘要合并）；但进度只在整个 chunk 处理完才落盘
-                    # （_process_chunks 里 processed=i+1），崩溃重启后同一个 chunk 会
-                    # 从头重新提取一遍，之前已经落盘的 preserve_raw 条目就会被原样
-                    # 再建一份。这里用精确内容匹配挡掉重复——preserve_raw 的定义就是
-                    # 「逐字原文」，完全相同的正文已经存在就是同一条，不是新记忆。
                     exact_finder = getattr(self.bucket_mgr, "find_exact_content", None)
                     if callable(exact_finder):
                         try:
@@ -755,10 +905,8 @@ class ImportEngine:
                                 continue
                         except Exception as exc:
                             logger.warning(
-                                f"[import] preserve_raw duplicate check failed, "
-                                f"proceeding to store: {exc}"
+                                f"[import] preserve_raw duplicate check failed, proceeding to store: {exc}"
                             )
-                    # Raw mode: store original content without summarization
                     await self.bucket_mgr.create(
                         content=item["content"],
                         tags=item.get("tags", []),
@@ -767,28 +915,21 @@ class ImportEngine:
                         valence=item.get("valence", _DEFAULT_VALENCE),
                         arousal=item.get("arousal", _DEFAULT_AROUSAL),
                         name=item.get("name"),
+                        source_tool="import",
+                        occurred_at=occurred_at,
+                        provenance=provenance,
                     )
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
                 else:
-                    # Normal mode: go through merge-or-create pipeline
-                    is_merged = await self._merge_or_create_item(item)
+                    is_merged = await self._merge_or_create_item(item, chunk)
                     if is_merged:
                         self.state.data["memories_merged"] += 1
                     else:
                         self.state.data["memories_created"] += 1
-
-                # Patch timestamp if available
-                if chunk.get("timestamp_start"):
-                    # We don't have update support for created, so skip
-                    pass
-
             except Exception as e:
                 err_msg = f"Failed to store memory {item.get('name', '?')!r}: {e}"
                 logger.warning(err_msg)
-                # 不记 state.errors 的话，/api/import/status 只会看到
-                # memories_created/merged 计数比 api_calls 少，却查不出为什么——
-                # LLM 提取失败已经在记了，存储失败没道理不记。
                 if len(self.state.data["errors"]) < _STATE_ERR_LOG_MAX:
                     self.state.data["errors"].append(err_msg[:_CHUNK_ERR_PREVIEW])
 
@@ -865,8 +1006,8 @@ class ImportEngine:
 
         return validated
 
-    async def _merge_or_create_item(self, item: dict) -> bool:
-        """Try to merge with existing bucket, or create new. Returns is_merged."""
+    async def _merge_or_create_item(self, item: dict, chunk: dict) -> bool:
+        """Exact duplicates merge; semantic neighbors become auditable relation edges."""
         content = item["content"]
         domain = item.get("domain", ["未分类"])
         tags = item.get("tags", [])
@@ -874,19 +1015,35 @@ class ImportEngine:
         valence = item.get("valence", _DEFAULT_VALENCE)
         arousal = item.get("arousal", _DEFAULT_AROUSAL)
         name = item.get("name", "")
+        provenance = self._chunk_provenance(chunk)
+        occurred_at = str(chunk.get("timestamp_start") or chunk.get("timestamp_end") or "")
+
+        exact_finder = getattr(self.bucket_mgr, "find_exact_content", None)
+        if callable(exact_finder):
+            try:
+                exact = exact_finder(content, domain_filter=domain or None)
+            except Exception as exc:
+                logger.warning(f"[import] exact duplicate check failed: {exc}")
+            else:
+                if exact:
+                    return True
 
         try:
-            existing = await self.bucket_mgr.search(content, limit=1, domain_filter=domain or None)
-        except Exception as _search_exc:
+            existing = await self.bucket_mgr.search(
+                content,
+                limit=3,
+                domain_filter=domain or None,
+            )
+        except Exception as exc:
             logger.warning(
-                f"[import] Duplicate search failed, skipping merge check: "
-                f"{type(_search_exc).__name__}: {_search_exc}"
+                f"[import] related-memory search failed: {type(exc).__name__}: {exc}"
             )
             existing = []
 
+        import_config = self.config.get("import") or {}
+        merge_mode = str(import_config.get("merge_mode") or "exact_only").strip().lower()
         merge_threshold = self.config.get("merge_threshold") or _DEFAULT_MERGE_THRESHOLD
-
-        if existing and existing[0].get("score", 0) > merge_threshold:
+        if merge_mode == "semantic" and existing and existing[0].get("score", 0) > merge_threshold:
             bucket = existing[0]
             if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
                 try:
@@ -898,17 +1055,37 @@ class ImportEngine:
                         bucket["id"],
                         content=merged,
                         tags=list(set((bucket["metadata"].get("tags") or []) + tags)),
-                        importance=max(bucket["metadata"].get("importance") or _DEFAULT_IMPORTANCE, importance),
+                        importance=max(
+                            bucket["metadata"].get("importance") or _DEFAULT_IMPORTANCE,
+                            importance,
+                        ),
                         domain=list(set((bucket["metadata"].get("domain") or []) + domain)),
                         valence=round((old_v + valence) / 2, 2),
                         arousal=round((old_a + arousal) / 2, 2),
                     )
                     return True
-                except Exception as e:
-                    logger.warning(f"Merge failed during import: {e}")
+                except Exception as exc:
+                    logger.warning(f"Merge failed during import: {exc}")
                     self.state.data["api_calls"] += 1
 
-        # Create new
+        try:
+            relation_threshold = float(
+                import_config.get("relation_threshold", _IMPORT_RELATION_THRESHOLD)
+            )
+        except (TypeError, ValueError, OverflowError):
+            relation_threshold = _IMPORT_RELATION_THRESHOLD
+        relations = [
+            {
+                "bucket_id": str(candidate.get("id") or ""),
+                "type": "related",
+                "score": candidate.get("score"),
+                "source": "history_import",
+            }
+            for candidate in existing
+            if candidate.get("id")
+            and float(candidate.get("score") or 0) >= relation_threshold
+        ]
+
         await self.bucket_mgr.create(
             content=content,
             tags=tags,
@@ -917,6 +1094,10 @@ class ImportEngine:
             valence=valence,
             arousal=arousal,
             name=name or None,
+            source_tool="import",
+            occurred_at=occurred_at,
+            provenance=provenance,
+            relations=relations,
         )
         return False
 

@@ -8,7 +8,8 @@ decay_engine.py — 记忆衰减引擎，模拟人类遗忘曲线
 
 关键行为：
 - 打分公式（改进版艾宾浩斯 + 情感坐标）：
-    Score = Importance × (activation_count^0.3) × e^(-λ×days) × emotion_weight
+    Score = Importance × (activation_count^0.3) × e^(-λ×days) × emotion_weight × association_bonus
+- association_bonus 是封顶的弱加成，不刷新 last_active；真正使用仍由 activation_count 计入
 - 情感权重 = base + arousal × arousal_boost；唤醒度高的记忆衰减得慢
 - pinned / protected 桶不参与衰减、不被归档
 - ensure_started() 幂等启动后台循环；可被测试 monkeypatch 成 noop
@@ -70,8 +71,10 @@ _SHORT_TERM_DAYS = 3.0
 _SHORT_TERM_TIME_RATIO = 0.7
 _LONG_TERM_EMOTION_RATIO = 0.7
 
-# --- Activation count 的次线性放大：访问越多越鲜活，但不线性 ---
+# --- Activation count 的次线性放大：真实使用越多越鲜活，但不线性 ---
 _ACTIVATION_EXPONENT = 0.3
+_ASSOCIATION_BONUS_PER_LINK = 0.03  # 自动关系边每条只给 3% 弱加成
+_ASSOCIATION_BONUS_CAP = 5.0        # 最多 +15%，且不刷新 last_active
 
 # --- Resolved/digested 衰减加速因子 ---
 _FACTOR_RESOLVED_DIGESTED = 0.02  # 已处理 + 已写 feel → 加速淡化到背景
@@ -214,6 +217,11 @@ class DecayEngine:
         except (TypeError, ValueError):
             importance = _DEFAULT_IMPORTANCE
         activation_count = max(1.0, float(metadata.get("activation_count") or 1))
+        association_count = min(
+            max(0.0, float(metadata.get("association_count") or 0)),
+            _ASSOCIATION_BONUS_CAP,
+        )
+        association_bonus = 1.0 + association_count * _ASSOCIATION_BONUS_PER_LINK
 
         # --- Days since last activation ---
         days_since = _days_since_active(metadata, fallback_days=_DEFAULT_DAYS_FALLBACK)
@@ -250,6 +258,7 @@ class DecayEngine:
             * (activation_count ** _ACTIVATION_EXPONENT)
             * math.exp(-self.decay_lambda * days_since)
             * combined_weight
+            * association_bonus
         )
 
         # --- Weight pool modifiers ---

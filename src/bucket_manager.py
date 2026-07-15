@@ -202,6 +202,24 @@ _MEDIA_TITLE_MAX = 200
 _MEDIA_TYPE_MAX = 32
 _MEDIA_NOTE_MAX = 500
 
+# --- Provenance / relation audit metadata ---
+_PROVENANCE_TEXT_MAX = 500
+_PROVENANCE_LIST_MAX_ITEMS = 200
+_RELATION_MAX_ITEMS = 64
+_RELATION_BUCKET_ID_MAX = 128
+_RELATION_TYPE_MAX = 32
+_RELATION_SOURCE_MAX = 64
+_RELATION_ALLOWED_TYPES = {
+    "duplicate",
+    "related",
+    "continuation",
+    "clarification",
+    "evolution",
+    "contradiction",
+    "cause",
+    "fulfilled",
+}
+
 _METADATA_TEXT_LIMITS = {
     "status": 32,
     "type": 32,
@@ -609,6 +627,90 @@ class BucketManager:
                 break
         return normalized
 
+    @classmethod
+    def _normalize_provenance(cls, provenance) -> dict:
+        """Keep import/source evidence compact, explicit, and YAML-safe."""
+        if not isinstance(provenance, dict):
+            return {}
+        scalar_keys = (
+            "kind",
+            "created_by",
+            "source_platform",
+            "source_file",
+            "source_hash",
+            "imported_at",
+            "timestamp_start",
+            "timestamp_end",
+            "raw_ref",
+        )
+        list_keys = ("conversation_ids", "message_ids", "channels")
+        normalized: dict = {}
+        for key in scalar_keys:
+            value = provenance.get(key)
+            if value is None or value == "":
+                continue
+            normalized[key] = cls._sanitize_text(str(value)).strip()[:_PROVENANCE_TEXT_MAX]
+        for key in list_keys:
+            values = provenance.get(key)
+            if values is None:
+                continue
+            normalized_values = cls._normalize_metadata_list(
+                values,
+                max_items=_PROVENANCE_LIST_MAX_ITEMS,
+                max_chars=_PROVENANCE_TEXT_MAX,
+            )
+            if normalized_values:
+                normalized[key] = normalized_values
+        if provenance.get("erasable") is True:
+            normalized["erasable"] = True
+        return normalized
+
+    @classmethod
+    def _normalize_relations(cls, relations) -> list[dict]:
+        """Normalize auditable bucket-to-bucket edges without rewriting meaning."""
+        if not relations:
+            return []
+        if isinstance(relations, dict):
+            relations = [relations]
+        if not isinstance(relations, (list, tuple)):
+            return []
+        normalized: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for item in relations:
+            if not isinstance(item, dict):
+                continue
+            bucket_id = cls._sanitize_text(str(item.get("bucket_id") or "")).strip()[
+                :_RELATION_BUCKET_ID_MAX
+            ]
+            if not bucket_id:
+                continue
+            relation_type = cls._sanitize_text(str(item.get("type") or "related")).strip()[
+                :_RELATION_TYPE_MAX
+            ]
+            if relation_type not in _RELATION_ALLOWED_TYPES:
+                relation_type = "related"
+            key = (bucket_id, relation_type)
+            if key in seen:
+                continue
+            entry: dict = {"bucket_id": bucket_id, "type": relation_type}
+            source = cls._sanitize_text(str(item.get("source") or "")).strip()[:_RELATION_SOURCE_MAX]
+            if source:
+                entry["source"] = source
+            try:
+                score = float(item.get("score"))
+            except (TypeError, ValueError, OverflowError):
+                score = None
+            if score is not None and math.isfinite(score):
+                entry["score"] = round(score, 4)
+            created_at = cls._sanitize_text(str(item.get("created_at") or "")).strip()[:64]
+            if created_at:
+                entry["created_at"] = created_at
+            normalized.append(entry)
+            seen.add(key)
+            if len(normalized) >= _RELATION_MAX_ITEMS:
+                break
+        return normalized
+
     # ---------------------------------------------------------
     # Internal: keep embedding index in sync with markdown storage
     # 内部：保证向量索引与 markdown 存储层一致
@@ -701,9 +803,10 @@ class BucketManager:
         *,
         last_active=None,
         activation_count=None,
+        metadata_updates: Optional[dict] = None,
         file_path: str = "",
     ) -> None:
-        """touch/ripple 只改了某桶的激活字段（集合没变）→ 就地更新缓存，不清整表。"""
+        """Update in-place metadata fields for one cached bucket without rebuilding the set."""
         if self._active_cache is None:
             return
         for b in self._active_cache:
@@ -714,6 +817,8 @@ class BucketManager:
                         m["last_active"] = last_active
                     if activation_count is not None:
                         m["activation_count"] = activation_count
+                    if metadata_updates:
+                        m.update(metadata_updates)
                 break
         if file_path:
             self._refresh_cached_file_state(file_path)
@@ -896,6 +1001,9 @@ class BucketManager:
         meaning: str = "",
         media: Any = None,
         test_data: bool = False,
+        occurred_at: str = "",
+        provenance: Optional[dict] = None,
+        relations: Any = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -985,14 +1093,28 @@ class BucketManager:
             "type": bucket_type,
             "created": now_iso(),
             "last_active": now_iso(),
+            # activation_count remains the ranking input and now means an explicit
+            # use/activation, not a mere search result being displayed.
             "activation_count": 0,
+            "retrieval_count": 0,
+            "used_count": 0,
+            "association_count": 0,
         }
+        normalized_provenance = self._normalize_provenance(provenance)
         if test_data:
-            metadata["provenance"] = {
+            normalized_provenance.update({
                 "kind": "test",
                 "created_by": str(source_tool or "developer")[:_SOURCE_TOOL_MAX],
                 "erasable": True,
-            }
+            })
+        if normalized_provenance:
+            metadata["provenance"] = normalized_provenance
+        normalized_occurred_at = self._sanitize_text(str(occurred_at or "")).strip()[:64]
+        if normalized_occurred_at:
+            metadata["occurred_at"] = normalized_occurred_at
+        normalized_relations = self._normalize_relations(relations)
+        if normalized_relations:
+            metadata["relations"] = normalized_relations
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -1301,6 +1423,16 @@ class BucketManager:
         if "meaning_append" in kwargs:
             # Miss: meaning_append 是追加一条新 meaning（trace 的 meaning_append / hold 每次调用）。
             kwargs["meaning_append"] = self._normalize_meaning_item(kwargs["meaning_append"])
+        if "provenance" in kwargs:
+            kwargs["provenance"] = self._normalize_provenance(kwargs["provenance"])
+        if "relations" in kwargs:
+            kwargs["relations"] = self._normalize_relations(kwargs["relations"])
+        if "relations_append" in kwargs:
+            kwargs["relations_append"] = self._normalize_relations(kwargs["relations_append"])
+        if "occurred_at" in kwargs:
+            kwargs["occurred_at"] = self._sanitize_text(
+                str(kwargs["occurred_at"] or "")
+            ).strip()[:64]
 
         try:
             post = frontmatter.load(file_path)
@@ -1369,6 +1501,35 @@ class BucketManager:
             if isinstance(existing_meaning, str):
                 existing_meaning = [existing_meaning]
             post["meaning"] = (list(existing_meaning) + [kwargs["meaning_append"]])[:_MEANING_LIST_MAX_ITEMS]
+        if "provenance" in kwargs:
+            if kwargs["provenance"]:
+                post["provenance"] = kwargs["provenance"]
+            else:
+                post.metadata.pop("provenance", None)
+        if "relations" in kwargs:
+            if kwargs["relations"]:
+                post["relations"] = kwargs["relations"]
+            else:
+                post.metadata.pop("relations", None)
+        if "relations_append" in kwargs and kwargs["relations_append"]:
+            existing_relations = self._normalize_relations(post.get("relations") or [])
+            seen = {
+                (str(item.get("bucket_id") or ""), str(item.get("type") or "related"))
+                for item in existing_relations
+            }
+            for item in kwargs["relations_append"]:
+                key = (str(item.get("bucket_id") or ""), str(item.get("type") or "related"))
+                if key not in seen:
+                    existing_relations.append(item)
+                    seen.add(key)
+                if len(existing_relations) >= _RELATION_MAX_ITEMS:
+                    break
+            post["relations"] = existing_relations
+        if "occurred_at" in kwargs:
+            if kwargs["occurred_at"]:
+                post["occurred_at"] = kwargs["occurred_at"]
+            else:
+                post.metadata.pop("occurred_at", None)
         # --- Pass-through fields for plan/letter lifecycle ---
         # --- plan/letter/iter1.7 生命周期相关字段直接透传到 frontmatter ---
         # 这一组字段没有「校验/转换」逻辑，给什么写什么。新增字段往这个元组里加即可。
@@ -1443,6 +1604,8 @@ class BucketManager:
         if bump_active:
             post["last_active"] = now_iso()
             post["activation_count"] = int(post.get("activation_count") or 0) + 1
+            post["used_count"] = int(post.get("used_count") or 0) + 1
+            post["last_used_at"] = post["last_active"]
 
         try:
             _atomic_write_text(file_path, frontmatter.dumps(post))
@@ -1455,6 +1618,10 @@ class BucketManager:
                 bucket_id,
                 last_active=post["last_active"],
                 activation_count=post["activation_count"],
+                metadata_updates={
+                    "used_count": post["used_count"],
+                    "last_used_at": post["last_used_at"],
+                },
                 file_path=file_path,
             )
 
@@ -1631,10 +1798,166 @@ class BucketManager:
         return True
 
     # ---------------------------------------------------------
+    # Retrieval / association audit events (do not affect decay ranking)
+    # ---------------------------------------------------------
+    async def record_retrieval(self, bucket_id: str, source: str = "search") -> None:
+        """Record that a bucket was shown to a caller without treating it as used."""
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return
+            try:
+                post = frontmatter.load(file_path)
+                timestamp = now_iso()
+                post["retrieval_count"] = int(post.get("retrieval_count") or 0) + 1
+                post["last_retrieved_at"] = timestamp
+                clean_source = self._sanitize_text(str(source or "search")).strip()[:_SOURCE_TOOL_MAX]
+                if clean_source:
+                    post["last_retrieval_source"] = clean_source
+                _atomic_write_text(file_path, frontmatter.dumps(post))
+                updates = {
+                    "retrieval_count": post["retrieval_count"],
+                    "last_retrieved_at": timestamp,
+                }
+                if clean_source:
+                    updates["last_retrieval_source"] = clean_source
+                self._cache_bump(bucket_id, metadata_updates=updates, file_path=file_path)
+                self._record_ledger_event(
+                    "TraceUpdated",
+                    bucket_id,
+                    str(post.get("type") or "dynamic"),
+                    post.content or "",
+                    dict(post.metadata),
+                    {
+                        "audit_kind": "retrieval",
+                        "retrieval_source": clean_source or "search",
+                    },
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to record retrieval / 记录检索失败: {bucket_id}: {exc}")
+
+    async def record_retrieval_many(self, bucket_ids: list, source: str = "search") -> None:
+        for bucket_id in bucket_ids:
+            try:
+                await self.record_retrieval(str(bucket_id), source=source)
+            except Exception as exc:
+                logger.warning(f"record_retrieval_many failed for {bucket_id}: {exc}")
+
+    async def record_use(self, bucket_id: str, source: str = "breath_search") -> None:
+        """Record an explicit recall as both retrieval and real use in one write."""
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return
+            try:
+                post = frontmatter.load(file_path)
+                timestamp = now_iso()
+                post["retrieval_count"] = int(post.get("retrieval_count") or 0) + 1
+                post["last_retrieved_at"] = timestamp
+                post["activation_count"] = int(post.get("activation_count") or 0) + 1
+                post["used_count"] = int(post.get("used_count") or 0) + 1
+                post["last_active"] = timestamp
+                post["last_used_at"] = timestamp
+                clean_source = self._sanitize_text(str(source or "breath_search")).strip()[
+                    :_SOURCE_TOOL_MAX
+                ]
+                if clean_source:
+                    post["last_retrieval_source"] = clean_source
+                    post["last_use_source"] = clean_source
+                _atomic_write_text(file_path, frontmatter.dumps(post))
+                updates = {
+                    "retrieval_count": post["retrieval_count"],
+                    "last_retrieved_at": timestamp,
+                    "used_count": post["used_count"],
+                    "last_used_at": timestamp,
+                }
+                if clean_source:
+                    updates["last_retrieval_source"] = clean_source
+                    updates["last_use_source"] = clean_source
+                self._cache_bump(
+                    bucket_id,
+                    last_active=timestamp,
+                    activation_count=post["activation_count"],
+                    metadata_updates=updates,
+                    file_path=file_path,
+                )
+                self._record_ledger_event(
+                    "TraceTouched",
+                    bucket_id,
+                    str(post.get("type") or "dynamic"),
+                    post.content or "",
+                    dict(post.metadata),
+                    {
+                        "audit_kind": "use",
+                        "use_source": clean_source or "breath_search",
+                    },
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to record use / 记录使用失败: {bucket_id}: {exc}")
+
+    async def record_use_many(self, bucket_ids: list, source: str = "breath_search") -> None:
+        for bucket_id in bucket_ids:
+            try:
+                await self.record_use(str(bucket_id), source=source)
+            except Exception as exc:
+                logger.warning(f"record_use_many failed for {bucket_id}: {exc}")
+
+    async def record_association(self, bucket_id: str, source: str = "write_then_recall") -> None:
+        """Record an automatic relation candidate without refreshing last_active."""
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return
+            try:
+                post = frontmatter.load(file_path)
+                timestamp = now_iso()
+                post["retrieval_count"] = int(post.get("retrieval_count") or 0) + 1
+                post["last_retrieved_at"] = timestamp
+                post["association_count"] = int(post.get("association_count") or 0) + 1
+                post["last_associated_at"] = timestamp
+                clean_source = self._sanitize_text(str(source or "write_then_recall")).strip()[
+                    :_SOURCE_TOOL_MAX
+                ]
+                if clean_source:
+                    post["last_retrieval_source"] = clean_source
+                    post["last_association_source"] = clean_source
+                _atomic_write_text(file_path, frontmatter.dumps(post))
+                updates = {
+                    "retrieval_count": post["retrieval_count"],
+                    "last_retrieved_at": timestamp,
+                    "association_count": post["association_count"],
+                    "last_associated_at": timestamp,
+                }
+                if clean_source:
+                    updates["last_retrieval_source"] = clean_source
+                    updates["last_association_source"] = clean_source
+                self._cache_bump(bucket_id, metadata_updates=updates, file_path=file_path)
+                self._record_ledger_event(
+                    "TraceUpdated",
+                    bucket_id,
+                    str(post.get("type") or "dynamic"),
+                    post.content or "",
+                    dict(post.metadata),
+                    {
+                        "audit_kind": "association",
+                        "association_source": clean_source or "write_then_recall",
+                    },
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to record association / 记录关联失败: {bucket_id}: {exc}")
+
+    async def record_association_many(self, bucket_ids: list, source: str = "write_then_recall") -> None:
+        for bucket_id in bucket_ids:
+            try:
+                await self.record_association(str(bucket_id), source=source)
+            except Exception as exc:
+                logger.warning(f"record_association_many failed for {bucket_id}: {exc}")
+
+    # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
     # 触碰桶（刷新激活时间 + 累加激活次数）
-    # Called on every recall hit; affects decay score.
-    # 每次检索命中时调用，影响衰减得分。
+    # Legacy/explicit activation path; affects decay score.
+    # 兼容旧调用与显式激活路径；自动关联不会走这里。
     # ---------------------------------------------------------
     async def touch(self, bucket_id: str, ripple: bool = True) -> None:
         """
@@ -1657,12 +1980,18 @@ class BucketManager:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = int(post.get("activation_count") or 0) + 1  # type: ignore[call-overload]
+            post["used_count"] = int(post.get("used_count") or 0) + 1
+            post["last_used_at"] = post["last_active"]
 
             _atomic_write_text(file_path, frontmatter.dumps(post))
             self._cache_bump(
                 bucket_id,
                 last_active=post["last_active"],
                 activation_count=post["activation_count"],
+                metadata_updates={
+                    "used_count": post["used_count"],
+                    "last_used_at": post["last_used_at"],
+                },
                 file_path=file_path,
             )
 

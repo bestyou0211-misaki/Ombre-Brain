@@ -11,7 +11,7 @@ tools/breath/search.py — 有 query 的检索模式
 - embedding 未配置/未启用/调用失败时明确提示并继续关键词/BM25 检索
 - 向量通道阈值 sim>=0.65；domain/tags/type 过滤与关键词通道完全一致
 - 命中正文不经过 LLM 摘要、改写或压缩，直接返回当前存储的 content
-- 命中后调 touch()，但不修改本次返回的正文或元数据
+- 主动 query 命中视为真实使用并刷新；自动写即读关联只走弱关联，不冒充使用
 - 检索结果 < 3 时 40% 概率从低权重旧桶里随机漂出 1-3 条「忽然想起来」
 - 命中 0 条时回 webhook 报空，并给出可操作的引导文案
 
@@ -35,6 +35,18 @@ from ._verbatim import render_stored_bucket
 _SURFACE_POLICY = SurfacePolicyVM.default()
 
 _VECTOR_QUERY_TOPK = 50
+
+def _schedule_use(bucket_ids: list[str], source: str) -> None:
+    """Explicit breath search is a real use; keep compatibility with older managers."""
+    if not bucket_ids:
+        return
+    recorder = getattr(rt.bucket_mgr, "record_use_many", None)
+    if callable(recorder):
+        asyncio.create_task(recorder(bucket_ids, source=source))
+        return
+    legacy_touch = getattr(rt.bucket_mgr, "touch_many", None)
+    if callable(legacy_touch):
+        asyncio.create_task(legacy_touch(bucket_ids, ripple=False))
 
 _SEMANTIC_DISABLED_NOTE = "[检索降级：语义索引暂不可用，本次仅使用关键词/BM25。]"
 _BUDGET_NOTICE = "[token 预算不足：命中的下一条记忆未被截断或摘要，请提高 max_tokens 后重试。]"
@@ -115,9 +127,7 @@ async def surface_search(
             )
             if entry_tokens > max_tokens:
                 return _BUDGET_NOTICE
-            asyncio.create_task(
-                rt.bucket_mgr.touch_many([exact_bucket["id"]], ripple=False)
-            )
+            _schedule_use([exact_bucket["id"]], source="breath_exact")
             if rt.fire_webhook:
                 await rt.fire_webhook(
                     "breath",
@@ -153,7 +163,7 @@ async def surface_search(
     results = []
     token_used = 0
     budget_blocked = False
-    touched_ids: list = []   # 性能 P2：浮现后统一在后台 touch，不在响应路径逐条 await
+    used_ids: list = []  # 主动 query 是显式召回，按真实使用记账
     for bucket in matches:
         meta = bucket["metadata"]
         bucket_id = bucket["id"]
@@ -170,12 +180,12 @@ async def surface_search(
             break
         results.append(rendered)
         token_used += entry_tokens
-        touched_ids.append(bucket_id)
+        used_ids.append(bucket_id)
 
-    # 性能 P2：把 touch 移出响应路径 —— 浮现完的桶在后台一次性更新激活，
-    # ripple=False 跳过读全库的时间涟漪。响应不再等这些写盘/涟漪。
-    if touched_ids:
-        asyncio.create_task(rt.bucket_mgr.touch_many(touched_ids, ripple=False))
+    # 主动 query 是显式召回，按真实使用写 retrieval + use；
+    # 自动写即读仍只记弱关联，避免关系图回声自我续命。
+    if used_ids:
+        _schedule_use(used_ids, source="breath_search")
 
     # --- 检索结果 < 3 时 40% 概率随机浮现 ---
     if not budget_blocked and len(matches) < min(3, max_results) and random.random() < 0.4:

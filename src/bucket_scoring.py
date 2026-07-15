@@ -45,7 +45,9 @@ TIME_DECAY_LAMBDA = 0.02  # e^(-λ*days)，越小 → 起冷起慢
 TIME_FALLBACK_DAYS = 30   # 无可解析 last_active 时的默认天数
 
 # --- touch 维度 ---
-TOUCH_NORMALIZE_CAP = 10.0   # activation_count / 该值，裁到 1.0
+TOUCH_NORMALIZE_CAP = 10.0   # effective touch count / 该值，裁到 1.0
+ASSOCIATION_TOUCH_WEIGHT = 0.2  # 自动关联只算一次真实使用的 20%，不重置时间
+ASSOCIATION_TOUCH_CAP = 5.0     # 防止关系图回声无限抬权重
 
 
 # ---------------------------------------------------------
@@ -135,8 +137,13 @@ def calc_time_score(meta: dict) -> float:
 def calc_touch_score(meta: dict) -> float:
     """
     Calculate touch frequency score (0~1).
-    Normalizes activation_count over 10; capped at 1.0.
-    计算触碰频率得分（0~1），以 10 次为上限归一化。
+    Explicit activation carries full weight; automatic association is capped and weak.
+    真实使用按完整次数计，自动关联只给封顶的弱加成，避免记忆回声自我续命。
     """
-    count = float(meta.get("activation_count") or 0)
-    return min(count / TOUCH_NORMALIZE_CAP, 1.0)
+    activation_count = max(0.0, float(meta.get("activation_count") or 0))
+    association_count = min(
+        max(0.0, float(meta.get("association_count") or 0)),
+        ASSOCIATION_TOUCH_CAP,
+    )
+    effective_count = activation_count + association_count * ASSOCIATION_TOUCH_WEIGHT
+    return min(effective_count / TOUCH_NORMALIZE_CAP, 1.0)
