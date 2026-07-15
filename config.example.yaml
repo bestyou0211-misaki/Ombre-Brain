@@ -79,6 +79,16 @@ storage:
 # 存新记忆时，如果与已有桶的相似度超过此值（0-100），则合并而非新建
 merge_threshold: 75
 
+# --- Conversation history import / 对话历史导入 ---
+# exact_only: only byte-identical memories are deduplicated; semantic neighbors
+# are kept as separate events and connected with auditable relation edges.
+# semantic: opt back into the older LLM merge behavior above merge_threshold.
+# exact_only：只去重完全相同正文；语义相近但可能代表变化的事件保留为独立桶并连边。
+# semantic：恢复旧版的语义合并行为。
+import:
+  merge_mode: "exact_only"  # exact_only | semantic
+  relation_threshold: 45.0  # 0-100; candidates above this score become relation edges
+
 # --- Dehydration API / 脱水压缩 API 配置 ---
 # Uses a cheap LLM for intelligent compression. API is required; if the
 # configured key/endpoint is unavailable, hold/grow will raise an explicit
