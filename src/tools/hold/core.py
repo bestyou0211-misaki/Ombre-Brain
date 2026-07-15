@@ -96,4 +96,31 @@ async def store_core(
         result += f"\n⚠️ {embed_warn}"
     if metadata_fallback:
         result += "\n⚠️ 打标 API 暂不可用：正文已逐字保存，未做任何压缩；元数据暂用本地中性值。"
+
+    # === 写即读 (write-then-recall) hook ===
+    # hold成功后自动搜索关联旧记忆，刷新被唤醒记忆的权重
+    # 越早的记忆越优先被唤醒，形成正反馈循环
+    try:
+        _related = await rt.bm.search(content, limit=5)
+        # 排除刚存入的桶
+        _related = [r for r in _related if str(r.get('id', '')) != result_name]
+        # 按创建时间排序，越早越优先
+        _related.sort(key=lambda r: r.get('created_at', ''), reverse=False)
+        _related = _related[:3]
+        if _related:
+            # 刷新被唤醒记忆的权重（touch增加last_active）
+            _touch_ids = [str(r.get('id', '')) for r in _related if r.get('id')]
+            if _touch_ids:
+                await rt.bm.touch_many(_touch_ids, ripple=False)
+            # 附加关联记忆到返回文本
+            _recall_lines = []
+            for r in _related:
+                _bid = str(r.get('id', ''))
+                _name = r.get('name', '')
+                _body = str(r.get('content', ''))[:80]
+                _recall_lines.append(f"\U0001fa84 [{_bid}] {_name}: {_body}")
+            result += "\n\n\U0001f517 关联唤醒:\n" + "\n".join(_recall_lines)
+    except Exception as _e:
+        rt.logger.debug(f"write-then-recall hook failed (non-fatal): {_e}")
+
     return result
