@@ -101,8 +101,7 @@ async def store_core(
     # hold成功后自动搜索关联旧记忆，刷新被唤醒记忆的权重
     # 越早的记忆越优先被唤醒，形成正反馈循环
     try:
-        _related = await rt.bm.search(content, limit=5)
-        result += f"\n[debug] search returned {len(_related)} results"
+        _related = await rt.bucket_mgr.search(content, limit=5)
         # 排除刚存入的桶
         _related = [r for r in _related if str(r.get('id', '')) != result_name]
         # 按创建时间排序，越早越优先
@@ -112,7 +111,7 @@ async def store_core(
             # 刷新被唤醒记忆的权重（touch增加last_active）
             _touch_ids = [str(r.get('id', '')) for r in _related if r.get('id')]
             if _touch_ids:
-                await rt.bm.touch_many(_touch_ids, ripple=False)
+                await rt.bucket_mgr.touch_many(_touch_ids, ripple=False)
             # 附加关联记忆到返回文本
             _recall_lines = []
             for r in _related:
@@ -122,7 +121,6 @@ async def store_core(
                 _recall_lines.append(f"\U0001fa84 [{_bid}] {_name}: {_body}")
             result += "\n\n\U0001f517 关联唤醒:\n" + "\n".join(_recall_lines)
     except Exception as _e:
-        result += f"\n[debug-err] hook failed: {type(_e).__name__}: {_e}"
         rt.logger.warning(f"write-then-recall hook failed: {type(_e).__name__}: {_e}")
 
     return result
