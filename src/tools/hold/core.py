@@ -102,6 +102,7 @@ async def store_core(
     # 越早的记忆越优先被唤醒，形成正反馈循环
     try:
         _related = await rt.bm.search(content, limit=5)
+        result += f"\n[debug] search returned {len(_related)} results"
         # 排除刚存入的桶
         _related = [r for r in _related if str(r.get('id', '')) != result_name]
         # 按创建时间排序，越早越优先
@@ -121,6 +122,6 @@ async def store_core(
                 _recall_lines.append(f"\U0001fa84 [{_bid}] {_name}: {_body}")
             result += "\n\n\U0001f517 关联唤醒:\n" + "\n".join(_recall_lines)
     except Exception as _e:
-        rt.logger.debug(f"write-then-recall hook failed (non-fatal): {_e}")
+        rt.logger.warning(f"write-then-recall hook failed: {type(_e).__name__}: {_e}")
 
     return result
